@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react';
+import { ErrorBoundary } from './components/ErrorBoundary';
 import { cx } from './components/ui';
 import { TOOLS, type ToolId } from './tools';
 
@@ -74,9 +75,11 @@ export default function App() {
           <h1 className="text-2xl font-bold tracking-tight text-slate-900 dark:text-white">{tool.name}</h1>
           <p className="mt-1 text-sm text-slate-500 dark:text-slate-400">{tool.description}</p>
         </header>
-        {TOOLS.filter((t) => visited.has(t.id)).map(({ id, component: Tool }) => (
+        {TOOLS.filter((t) => visited.has(t.id)).map(({ id, name, component: Tool }) => (
           <div key={id} hidden={id !== active}>
-            <Tool />
+            <ErrorBoundary name={name}>
+              <Tool />
+            </ErrorBoundary>
           </div>
         ))}
       </main>

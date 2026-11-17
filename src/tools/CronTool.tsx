@@ -1,8 +1,8 @@
 import { useMemo, useState } from 'react';
-import { Alert, Button, CopyButton, Panel, TextInput, cx } from '../components/ui';
+import { Alert, Button, CopyButton, Panel, Select, TextInput, cx } from '../components/ui';
 import { useNow } from '../hooks/useNow';
-import { compressRanges, dayName, describeCron, monthName, nextRuns, parseCron, type CronField } from '../lib/cron';
-import { relativeTime } from '../lib/time';
+import { compressRanges, dayName, describeCron, monthName, nextRuns, nextRunsInZone, parseCron, type CronField } from '../lib/cron';
+import { LOCAL_TZ, allTimeZones, relativeTime } from '../lib/time';
 
 const PRESETS: Array<[string, string]> = [
   ['* * * * *', 'Every minute'],
@@ -25,10 +25,11 @@ const SYNTAX: Array<[string, string]> = [
   ['@daily …', '@yearly @monthly @weekly @daily @hourly'],
 ];
 
-const LOCAL_TZ = Intl.DateTimeFormat().resolvedOptions().timeZone;
-
 export default function CronTool() {
   const [expr, setExpr] = useState('0 9 * * 1-5');
+  // The zone the server running the schedule uses (cron reads times in its own zone).
+  const [tz, setTz] = useState(LOCAL_TZ);
+  const zones = useMemo(allTimeZones, []);
   const now = useNow(30_000);
 
   const parsed = useMemo(() => {
@@ -42,7 +43,10 @@ export default function CronTool() {
 
   // Recompute upcoming runs when the minute rolls over, not on every tick.
   const minuteKey = Math.floor(now / 60_000);
-  const runs = useMemo(() => (parsed.ok ? nextRuns(parsed.schedule, new Date(), 10) : []), [parsed, minuteKey]);
+  const runs = useMemo(
+    () => (!parsed.ok ? [] : tz === LOCAL_TZ ? nextRuns(parsed.schedule, new Date(), 10) : nextRunsInZone(parsed.schedule, tz, new Date(), 10)),
+    [parsed, tz, minuteKey],
+  );
 
   return (
     <div className="space-y-4">
@@ -81,7 +85,19 @@ export default function CronTool() {
               ))}
             </div>
           </Panel>
-          <Panel title="Next 10 runs" actions={<span className="text-xs text-slate-500 dark:text-slate-400">{LOCAL_TZ}</span>}>
+          <Panel
+            title="Next 10 runs"
+            actions={
+              <Select aria-label="Time zone the schedule runs in" value={tz} onChange={(e) => setTz(e.target.value)} className="max-w-56">
+                {zones.map((z) => (
+                  <option key={z} value={z}>
+                    {z}
+                    {z === LOCAL_TZ ? ' (local)' : ''}
+                  </option>
+                ))}
+              </Select>
+            }
+          >
             {runs.length === 0 ? (
               <Alert tone="warning">No runs in the next 8 years — this schedule may never fire (e.g. Feb 30).</Alert>
             ) : (
@@ -90,7 +106,7 @@ export default function CronTool() {
                   <li key={d.getTime()} className="flex items-baseline justify-between gap-3 text-sm">
                     <span className="font-mono tabular-nums text-slate-800 dark:text-slate-100">
                       <span className="mr-2 text-xs text-slate-400">{i + 1}.</span>
-                      {d.toLocaleString(undefined, { weekday: 'short', year: 'numeric', month: 'short', day: '2-digit', hour: '2-digit', minute: '2-digit' })}
+                      {d.toLocaleString(undefined, { timeZone: tz, weekday: 'short', year: 'numeric', month: 'short', day: '2-digit', hour: '2-digit', minute: '2-digit' })}
                     </span>
                     <span className="shrink-0 text-xs text-slate-500 dark:text-slate-400">{relativeTime(d.getTime(), now)}</span>
                   </li>

@@ -1,7 +1,10 @@
-import { useMemo, useState, type ReactNode } from 'react';
+import { useState, type ReactNode } from 'react';
 import { Alert, Badge, Checkbox, CopyButton, Panel, TextArea, TextInput, cx } from '../components/ui';
+import { useRegex } from '../hooks/useRegex';
+import type { RegexMatch, RegexResult } from '../lib/regex';
 
 const MAX_MATCHES = 1000;
+const NO_RESULT: RegexResult = { ok: true, matches: [], truncated: false };
 
 const FLAGS: Array<{ flag: string; label: string; title: string }> = [
   { flag: 'g', label: 'global', title: 'Find all matches' },
@@ -40,32 +43,11 @@ export default function RegexTool() {
   const [replaceOn, setReplaceOn] = useState(false);
   const [replacement, setReplacement] = useState('<$<user> at $<domain>>');
 
-  const result = useMemo(() => {
-    if (!pattern) return { ok: true as const, matches: [] as RegExpMatchArray[], truncated: false, regex: null };
-    try {
-      const regex = new RegExp(pattern, flags);
-      // matchAll requires the g flag; we still honor non-global by stopping after the first match.
-      const iter = new RegExp(pattern, flags.includes('g') ? flags : flags + 'g');
-      const matches: RegExpMatchArray[] = [];
-      let truncated = false;
-      for (const m of text.matchAll(iter)) {
-        if (matches.length >= MAX_MATCHES) {
-          truncated = true;
-          break;
-        }
-        matches.push(m);
-        if (!flags.includes('g')) break;
-      }
-      return { ok: true as const, matches, truncated, regex };
-    } catch (e) {
-      return { ok: false as const, error: (e as Error).message };
-    }
-  }, [pattern, flags, text]);
-
-  const replaced = useMemo(() => {
-    if (!replaceOn || !result.ok || !result.regex) return '';
-    return text.replace(result.regex, replacement);
-  }, [replaceOn, result, text, replacement]);
+  // Matching runs in a worker with a time limit, so a runaway pattern cannot freeze the page.
+  const state = useRegex({ pattern, flags, text, replacement: replaceOn ? replacement : undefined, maxMatches: MAX_MATCHES });
+  const result = state.status === 'done' ? state.result : state.status === 'running' ? (state.last ?? NO_RESULT) : NO_RESULT;
+  const timedOut = state.status === 'timeout';
+  const replaced = replaceOn && result.ok ? (result.replaced ?? '') : '';
 
   const toggleFlag = (f: string, on: boolean) =>
     setFlags((prev) => {
@@ -98,6 +80,12 @@ export default function RegexTool() {
             ))}
           </div>
           {!result.ok && <Alert tone="error">{result.error}</Alert>}
+          {timedOut && (
+            <Alert tone="warning">
+              Stopped after {state.ms / 1000} s without finishing. The pattern probably backtracks catastrophically on this text (for
+              example nested quantifiers such as <code>(a+)+</code>). Your input is kept; edit the pattern or the text to try again.
+            </Alert>
+          )}
         </div>
       </Panel>
 
@@ -107,15 +95,21 @@ export default function RegexTool() {
         </Panel>
         <Panel
           title="Matches highlighted"
-          actions={result.ok && <Badge tone={result.matches.length ? 'success' : 'neutral'}>{result.matches.length}{result.truncated && '+'} match{result.matches.length === 1 ? '' : 'es'}</Badge>}
+          actions={
+            timedOut ? (
+              <Badge tone="warning">timed out</Badge>
+            ) : (
+              result.ok && <Badge tone={result.matches.length ? 'success' : 'neutral'}>{result.matches.length}{result.truncated && '+'} match{result.matches.length === 1 ? '' : 'es'}</Badge>
+            )
+          }
         >
           <pre className="min-h-full whitespace-pre-wrap break-words rounded-lg bg-slate-50 p-3 font-mono text-sm leading-relaxed text-slate-800 dark:bg-slate-950 dark:text-slate-100">
-            {result.ok ? highlight(text, result.matches) : text}
+            {result.ok && !timedOut ? highlight(text, result.matches) : text}
           </pre>
         </Panel>
       </div>
 
-      {result.ok && result.matches.length > 0 && <MatchTable matches={result.matches} truncated={result.truncated} />}
+      {result.ok && !timedOut && result.matches.length > 0 && <MatchTable matches={result.matches} truncated={result.truncated} />}
 
       <Panel title={<Checkbox label="Replace" checked={replaceOn} onChange={setReplaceOn} />} actions={replaceOn && <CopyButton text={replaced} />}>
         {replaceOn ? (
@@ -151,11 +145,12 @@ export default function RegexTool() {
   );
 }
 
-function highlight(text: string, matches: RegExpMatchArray[]): ReactNode[] {
+function highlight(text: string, matches: RegexMatch[]): ReactNode[] {
   const out: ReactNode[] = [];
   let cursor = 0;
-  matches.forEach((m, i) => {
-    const start = m.index ?? 0;
+  matches.forEach((match, i) => {
+    const start = match.index;
+    const m = match.groups as [string, ...Array<string | undefined>];
     if (m[0].length === 0 || start < cursor) return;
     if (start > cursor) out.push(text.slice(cursor, start));
     out.push(
@@ -175,9 +170,9 @@ function highlight(text: string, matches: RegExpMatchArray[]): ReactNode[] {
   return out;
 }
 
-function MatchTable({ matches, truncated }: { matches: RegExpMatchArray[]; truncated: boolean }) {
-  const groupCount = matches[0].length - 1;
-  const named = Object.keys(matches[0].groups ?? {});
+function MatchTable({ matches, truncated }: { matches: RegexMatch[]; truncated: boolean }) {
+  const groupCount = matches[0]!.groups.length - 1;
+  const named = Object.keys(matches[0]!.named ?? {});
   return (
     <Panel title="Match details">
       {truncated && <Alert tone="warning" className="mb-3">Showing the first {MAX_MATCHES} matches.</Alert>}
@@ -198,10 +193,10 @@ function MatchTable({ matches, truncated }: { matches: RegExpMatchArray[]; trunc
               <tr key={i} className="align-top">
                 <td className="py-1.5 pr-4 text-slate-400">{i + 1}</td>
                 <td className="py-1.5 pr-4 text-slate-500">{m.index}</td>
-                <td className="break-all py-1.5 pr-4 font-semibold text-slate-800 dark:text-slate-100">{m[0] || <em className="text-slate-400">(empty)</em>}</td>
+                <td className="break-all py-1.5 pr-4 font-semibold text-slate-800 dark:text-slate-100">{m.groups[0] || <em className="text-slate-400">(empty)</em>}</td>
                 {named.length > 0
-                  ? named.map((n) => <td key={n} className="break-all py-1.5 pr-4 text-indigo-700 dark:text-indigo-300">{m.groups?.[n] ?? '—'}</td>)
-                  : m.slice(1).map((g, j) => <td key={j} className="break-all py-1.5 pr-4 text-indigo-700 dark:text-indigo-300">{g ?? '—'}</td>)}
+                  ? named.map((n) => <td key={n} className="break-all py-1.5 pr-4 text-indigo-700 dark:text-indigo-300">{m.named?.[n] ?? '—'}</td>)
+                  : m.groups.slice(1).map((g, j) => <td key={j} className="break-all py-1.5 pr-4 text-indigo-700 dark:text-indigo-300">{g ?? '—'}</td>)}
               </tr>
             ))}
           </tbody>

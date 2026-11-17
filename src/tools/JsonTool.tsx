@@ -1,6 +1,6 @@
 import { useMemo, useState } from 'react';
 import { Alert, Badge, Button, Checkbox, CopyButton, Panel, Segmented, Select, TextArea } from '../components/ui';
-import { describeJsonValue, diffJson, parseJson, sortKeys, type DiffEntry, type ParseResult } from '../lib/json';
+import { describeJsonValue, diffJson, jsonWarnings, parseJson, reformatJson, sortKeys, type DiffEntry, type ParseResult } from '../lib/json';
 
 const SAMPLE_LEFT = `{"name":"devtoolkit","version":"0.1.0","tags":["json","jwt","regex"],"author":{"name":"Ada","active":true},"stars":42,"license":null}`;
 const SAMPLE_RIGHT = `{"name":"devtoolkit","version":"0.2.0","tags":["json","jwt","cron"],"author":{"name":"Ada","active":true,"email":"ada@example.com"},"stars":42}`;
@@ -29,14 +29,29 @@ export default function JsonTool() {
   );
 }
 
-function ParseStatus({ text, result }: { text: string; result: ParseResult }) {
+function ParseStatus({ text, result, lossyNote }: { text: string; result: ParseResult; lossyNote?: string }) {
+  const warnings = useMemo(() => (result.ok ? jsonWarnings(text) : []), [text, result]);
   if (!text.trim()) return <Alert tone="neutral">Paste or type JSON to begin.</Alert>;
   if (result.ok) {
     const bytes = new TextEncoder().encode(text).length;
     return (
-      <Alert tone="success">
-        ✓ Valid JSON · {describeJsonValue(result.value)} · {bytes.toLocaleString()} bytes
-      </Alert>
+      <div className="space-y-2">
+        <Alert tone="success">
+          ✓ Valid JSON · {describeJsonValue(result.value)} · {bytes.toLocaleString()} bytes
+        </Alert>
+        {warnings.length > 0 && (
+          <Alert tone="warning">
+            <span className="font-semibold">JSON.parse would change some values{lossyNote ? `; ${lossyNote}` : ''}:</span>
+            <ul className="mt-1 list-disc pl-4">
+              {warnings.map((w) => (
+                <li key={`${w.line}:${w.message}`}>
+                  Line {w.line}: {w.message}
+                </li>
+              ))}
+            </ul>
+          </Alert>
+        )}
+      </div>
     );
   }
   return (
@@ -56,9 +71,12 @@ function JsonFormatter() {
   const parsed = useMemo(() => parseJson(input), [input]);
   const output = useMemo(() => {
     if (!parsed.ok) return '';
-    const value = sorted ? sortKeys(parsed.value) : parsed.value;
-    return mode === 'minify' ? JSON.stringify(value) : JSON.stringify(value, null, indent === 'tab' ? '\t' : Number(indent));
-  }, [parsed, mode, indent, sorted]);
+    const space = mode === 'minify' ? 0 : indent === 'tab' ? '\t' : Number(indent);
+    // Formatting and minifying work on the text itself, so big numbers and exact digits survive.
+    // Sorting needs the parsed values, which is where JavaScript's number limits apply.
+    if (!sorted) return reformatJson(input, space);
+    return JSON.stringify(sortKeys(parsed.value), null, space || undefined);
+  }, [parsed, input, mode, indent, sorted]);
 
   return (
     <div className="grid gap-4 lg:grid-cols-2">
@@ -80,7 +98,7 @@ function JsonFormatter() {
             invalid={!!input.trim() && !parsed.ok}
             placeholder='{"hello": "world"}'
           />
-          <ParseStatus text={input} result={parsed} />
+          <ParseStatus text={input} result={parsed} lossyNote={sorted ? 'with "Sort keys" on, the output has these changes' : 'formatting keeps them as written'} />
         </div>
       </Panel>
 
@@ -146,7 +164,7 @@ function JsonDiff() {
                 onChange={(e) => side.set(e.target.value)}
                 invalid={!!side.value.trim() && !side.result.ok}
               />
-              <ParseStatus text={side.value} result={side.result} />
+              <ParseStatus text={side.value} result={side.result} lossyNote="the diff compares the values as read" />
             </div>
           </Panel>
         ))}

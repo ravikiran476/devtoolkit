@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import { decodeBase64, encodeBase64 } from './base64';
-import { compressRanges, describeCron, nextRuns, parseCron } from './cron';
-import { diffJson, locateJsonError, parseJson, sortKeys } from './json';
+import { compressRanges, describeCron, nextRuns, nextRunsInZone, parseCron, zoneOffsetMs } from './cron';
+import { runRegex } from './regex';
+import { diffJson, jsonWarnings, locateJsonError, parseJson, reformatJson, sortKeys } from './json';
 import { decodeJwt, tokenState } from './jwt';
 import { parseTimestamp } from './time';
 import { formatUuid, inspectUuid, uuidV4, uuidV7 } from './uuid';
@@ -42,6 +43,63 @@ describe('json', () => {
 
   it('treats type changes as a single change', () => {
     expect(diffJson({ a: [1] }, { a: { 0: 1 } })).toHaveLength(1);
+  });
+
+  it('aligns arrays, so an insertion at the top is one addition', () => {
+    const before = [{ id: 1 }, { id: 2 }, { id: 3 }];
+    expect(diffJson(before, [{ id: 0 }, ...before])).toEqual([{ path: '$[0]', kind: 'added', after: { id: 0 } }]);
+    expect(diffJson(before, [before[0], before[2]])).toEqual([{ path: '$[1]', kind: 'removed', before: { id: 2 } }]);
+    // A modified element between unchanged ones shows field-level changes.
+    expect(diffJson(['a', { id: 2, n: 'x' }, 'c'], ['new', 'a', { id: 2, n: 'y' }, 'c'])).toEqual([
+      { path: '$[0]', kind: 'added', after: 'new' },
+      { path: '$[2].n', kind: 'changed', before: 'x', after: 'y' },
+    ]);
+    // Key order does not make elements different.
+    expect(diffJson([{ a: 1, b: 2 }], [{ b: 2, a: 1 }])).toEqual([]);
+  });
+
+  it('warns about values JSON.parse would change', () => {
+    const text = '{\n  "id": 12345678901234567890,\n  "pi": 3.14159265358979323846,\n  "ok": 9007199254740991,\n  "a": 1,\n  "a": 2,\n  "nested": [{"a": 1}, {"a": 2}],\n  "big": 1e400\n}';
+    expect(jsonWarnings(text)).toEqual([
+      { line: 2, message: '12345678901234567890 is larger than 2^53 and is read as 12345678901234567000' },
+      { line: 3, message: '3.14159265358979323846 has more digits than a double can hold and is read as 3.141592653589793' },
+      { line: 6, message: 'Duplicate key "a": only the last value is kept' },
+      { line: 8, message: '1e400 is out of range and is read as Infinity' },
+    ]);
+    expect(jsonWarnings('{"a": "12345678901234567890", "b": [1.5, -0.1]}')).toEqual([]);
+  });
+
+  it('reformats without changing any value', () => {
+    const text = '{"id":12345678901234567890,"s":"caf\\u00e9 \\"q\\"","a":1,"a":2,"e":{},"l":[],"n":[1,{"x":null}]}';
+    const pretty = reformatJson(text, 2);
+    expect(pretty).toContain('"id": 12345678901234567890');
+    expect(pretty).toContain('"s": "caf\\u00e9 \\"q\\""');
+    expect(reformatJson(pretty, 0)).toBe(text);
+    // Same layout as JSON.stringify for values it represents exactly.
+    const plain = '{"a":[1,{"b":[]}],"c":{},"d":"x"}';
+    for (const indent of [2, 4, '\t'] as const) expect(reformatJson(plain, indent)).toBe(JSON.stringify(JSON.parse(plain), null, indent));
+  });
+});
+
+describe('regex', () => {
+  it('returns matches as plain data, with numbered and named groups', () => {
+    const r = runRegex({ pattern: '(?<user>\\w+)@(\\w+)', flags: 'g', text: 'a@b, c@d', replacement: '$<user>' });
+    expect(r).toEqual({
+      ok: true,
+      truncated: false,
+      replaced: 'a, c',
+      matches: [
+        { index: 0, groups: ['a@b', 'a', 'b'], named: { user: 'a' } },
+        { index: 5, groups: ['c@d', 'c', 'd'], named: { user: 'c' } },
+      ],
+    });
+    expect(structuredClone(r)).toEqual(r); // can be posted from a worker
+  });
+
+  it('stops after the first match without g, caps matches, and reports bad patterns', () => {
+    expect(runRegex({ pattern: 'a', flags: '', text: 'aaa' })).toMatchObject({ matches: [{ index: 0 }] });
+    expect(runRegex({ pattern: 'a', flags: 'g', text: 'aaaa', maxMatches: 2 })).toMatchObject({ truncated: true, matches: [{}, {}] });
+    expect(runRegex({ pattern: '(', flags: '', text: '' })).toMatchObject({ ok: false });
   });
 });
 
@@ -148,6 +206,28 @@ describe('cron', () => {
     expect(() => parseCron('60 * * * *')).toThrow(/Minute/);
     expect(() => parseCron('* * *')).toThrow(/5 fields/);
     expect(() => parseCron('5-1 * * * *')).toThrow(/reversed/);
+  });
+
+  it('computes runs in another time zone, across daylight-saving changes', () => {
+    const iso = (ds: Date[]) => ds.map((d) => d.toISOString());
+    // 09:00 New York is 14:00 UTC in winter and 13:00 UTC in summer.
+    expect(iso(nextRunsInZone(parseCron('0 9 * * *'), 'America/New_York', new Date('2026-03-07T00:00:00Z'), 3))).toEqual([
+      '2026-03-07T14:00:00.000Z',
+      '2026-03-08T13:00:00.000Z',
+      '2026-03-09T13:00:00.000Z',
+    ]);
+    // 02:30 does not exist on 8 March 2026 in New York (clocks jump 02:00 → 03:00): no run that day.
+    expect(iso(nextRunsInZone(parseCron('30 2 * * *'), 'America/New_York', new Date('2026-03-07T12:00:00Z'), 2))).toEqual([
+      '2026-03-09T06:30:00.000Z',
+      '2026-03-10T06:30:00.000Z',
+    ]);
+    // 01:30 happens twice on 1 November 2026; it runs once.
+    expect(nextRunsInZone(parseCron('30 1 1 11 *'), 'America/New_York', new Date('2026-10-31T00:00:00Z'), 1)).toHaveLength(1);
+    expect(iso(nextRunsInZone(parseCron('*/15 * * * *'), 'Asia/Kolkata', new Date('2026-01-01T10:07:00Z'), 2))).toEqual([
+      '2026-01-01T10:15:00.000Z',
+      '2026-01-01T10:30:00.000Z',
+    ]);
+    expect(zoneOffsetMs('Asia/Kolkata', Date.UTC(2026, 0, 1))).toBe(5.5 * 3600e3);
   });
 
   it('compresses ranges', () => {

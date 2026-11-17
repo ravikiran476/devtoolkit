@@ -153,6 +153,65 @@ export function nextRuns(s: CronSchedule, from: Date = new Date(), count = 10): 
   return out;
 }
 
+const partsFormatters = new Map<string, Intl.DateTimeFormat>();
+
+/** Offset of `timeZone` from UTC at an instant, in ms (positive east of Greenwich). */
+export function zoneOffsetMs(timeZone: string, instant: number): number {
+  let f = partsFormatters.get(timeZone);
+  if (!f) {
+    f = new Intl.DateTimeFormat('en-US', { timeZone, hourCycle: 'h23', year: 'numeric', month: 'numeric', day: 'numeric', hour: 'numeric', minute: 'numeric', second: 'numeric' });
+    partsFormatters.set(timeZone, f);
+  }
+  const p = Object.fromEntries(f.formatToParts(instant).map((x) => [x.type, Number(x.value)]));
+  const asUtc = Date.UTC(p.year!, p.month! - 1, p.day!, p.hour! % 24, p.minute!, p.second!);
+  return asUtc - Math.floor(instant / 1000) * 1000;
+}
+
+/** The instant a wall-clock time (given as UTC fields) happens in `timeZone`, or null if a DST jump skips it. */
+function wallToInstant(wall: number, timeZone: string): number | null {
+  const first = wall - zoneOffsetMs(timeZone, wall);
+  if (first + zoneOffsetMs(timeZone, first) === wall) return first;
+  const second = wall - zoneOffsetMs(timeZone, first);
+  if (second + zoneOffsetMs(timeZone, second) === wall) return second;
+  return null;
+}
+
+/**
+ * Next `count` run times strictly after `from`, with the schedule read as wall-clock time in
+ * `timeZone` (an IANA name such as "America/New_York"). A time skipped by a daylight-saving
+ * jump does not run; a repeated hour runs once.
+ */
+export function nextRunsInZone(s: CronSchedule, timeZone: string, from: Date = new Date(), count = 10): Date[] {
+  const start = from.getTime();
+  // A Date whose UTC fields hold the wall-clock time in the zone.
+  const d = new Date(Math.floor((start + zoneOffsetMs(timeZone, start)) / 60_000) * 60_000 + 60_000);
+  const horizon = d.getTime() + 8 * 366 * 24 * 3600e3;
+  const out: Date[] = [];
+  const dayOk = () => {
+    const dom = s.dayOfMonth.values.includes(d.getUTCDate());
+    const dow = s.dayOfWeek.values.includes(d.getUTCDay());
+    return s.dayOfMonth.restricted && s.dayOfWeek.restricted ? dom || dow : dom && dow;
+  };
+  for (let guard = 0; out.length < count && d.getTime() <= horizon && guard < 200_000; guard++) {
+    if (!s.month.values.includes(d.getUTCMonth() + 1)) {
+      d.setUTCMonth(d.getUTCMonth() + 1, 1);
+      d.setUTCHours(0, 0, 0, 0);
+    } else if (!dayOk()) {
+      d.setUTCDate(d.getUTCDate() + 1);
+      d.setUTCHours(0, 0, 0, 0);
+    } else if (!s.hour.values.includes(d.getUTCHours())) {
+      d.setUTCHours(d.getUTCHours() + 1, 0, 0, 0);
+    } else if (!s.minute.values.includes(d.getUTCMinutes())) {
+      d.setUTCMinutes(d.getUTCMinutes() + 1, 0, 0);
+    } else {
+      const instant = wallToInstant(d.getTime(), timeZone);
+      if (instant !== null && instant > start) out.push(new Date(instant));
+      d.setUTCMinutes(d.getUTCMinutes() + 1, 0, 0);
+    }
+  }
+  return out;
+}
+
 /** Collapses runs of 3+ consecutive numbers: [1,2,3,5] → "1–3, 5". */
 export function compressRanges(nums: number[], label: (n: number) => string = String): string {
   const parts: string[] = [];

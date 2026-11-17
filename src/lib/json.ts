@@ -146,6 +146,105 @@ export function locateJsonError(text: string): JsonErrorLocation | null {
   }
 }
 
+export interface JsonWarning {
+  line: number;
+  message: string;
+}
+
+const lineAt = (text: string, offset: number) => text.slice(0, offset).split('\n').length;
+
+/**
+ * Things JSON.parse silently changes in valid JSON: integers beyond 2^53 and decimals with
+ * more digits than a double holds are rounded, and only the last of duplicate keys is kept.
+ * Expects text that JSON.parse accepts.
+ */
+export function jsonWarnings(text: string, limit = 20): JsonWarning[] {
+  const warnings: JsonWarning[] = [];
+  const stack: Array<Set<string> | null> = []; // one entry per open object (key set) or array (null)
+  let expectKey = false;
+  for (let i = 0; i < text.length && warnings.length < limit; i++) {
+    const ch = text[i];
+    if (ch === '"') {
+      const start = i;
+      for (i++; i < text.length && text[i] !== '"'; i++) if (text[i] === '\\') i++;
+      const top = stack[stack.length - 1];
+      if (expectKey && top) {
+        const key = JSON.parse(text.slice(start, i + 1)) as string;
+        if (top.has(key)) warnings.push({ line: lineAt(text, start), message: `Duplicate key ${JSON.stringify(key)}: only the last value is kept` });
+        top.add(key);
+      }
+      expectKey = false;
+    } else if (ch === '{') {
+      stack.push(new Set());
+      expectKey = true;
+    } else if (ch === '[') {
+      stack.push(null);
+    } else if (ch === '}' || ch === ']') {
+      stack.pop();
+    } else if (ch === ',') {
+      expectKey = stack[stack.length - 1] != null;
+    } else if (ch === '-' || (ch >= '0' && ch <= '9')) {
+      const m = /-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?/y;
+      m.lastIndex = i;
+      const raw = m.exec(text)![0];
+      const value = Number(raw);
+      const isInteger = /^-?\d+$/.test(raw);
+      const digits = raw.replace(/^-/, '').replace(/[eE].*$/, '').replace('.', '').replace(/^0+/, '');
+      if (!Number.isFinite(value)) {
+        warnings.push({ line: lineAt(text, i), message: `${raw} is out of range and is read as ${String(value)}` });
+      } else if (isInteger && !Number.isSafeInteger(value)) {
+        warnings.push({ line: lineAt(text, i), message: `${raw} is larger than 2^53 and is read as ${String(value)}` });
+      } else if (!isInteger && digits.replace(/0+$/, '').length > 17) {
+        warnings.push({ line: lineAt(text, i), message: `${raw} has more digits than a double can hold and is read as ${String(value)}` });
+      }
+      i += raw.length - 1;
+    }
+  }
+  return warnings;
+}
+
+/**
+ * Re-indents (or minifies) valid JSON without parsing it into JavaScript values, so numbers,
+ * string escapes and duplicate keys come out exactly as they went in. Layout matches
+ * JSON.stringify(value, null, indent).
+ */
+export function reformatJson(text: string, indent: string | number = 2): string {
+  const pad = typeof indent === 'number' ? ' '.repeat(indent) : indent;
+  const out: string[] = [];
+  let depth = 0;
+  const newline = () => (pad ? `\n${pad.repeat(depth)}` : '');
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i]!;
+    if (ch === ' ' || ch === '\t' || ch === '\n' || ch === '\r') continue;
+    if (ch === '"') {
+      const start = i;
+      for (i++; i < text.length && text[i] !== '"'; i++) if (text[i] === '\\') i++;
+      out.push(text.slice(start, i + 1));
+    } else if (ch === '{' || ch === '[') {
+      // Empty containers stay on one line, as in JSON.stringify.
+      let j = i + 1;
+      while (j < text.length && ' \t\n\r'.includes(text[j]!)) j++;
+      if (text[j] === (ch === '{' ? '}' : ']')) {
+        out.push(ch === '{' ? '{}' : '[]');
+        i = j;
+        continue;
+      }
+      depth++;
+      out.push(ch + newline());
+    } else if (ch === '}' || ch === ']') {
+      depth--;
+      out.push(newline() + ch);
+    } else if (ch === ',') {
+      out.push(',' + newline());
+    } else if (ch === ':') {
+      out.push(pad ? ': ' : ':');
+    } else {
+      out.push(ch);
+    }
+  }
+  return out.join('');
+}
+
 /** Recursively sorts object keys alphabetically. Arrays keep their order. */
 export function sortKeys(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(sortKeys);
@@ -195,9 +294,26 @@ export function diffJson(before: unknown, after: unknown, path = '$'): DiffEntry
     });
   }
 
-  if (tb === 'array') {
-    const b = before as unknown[];
-    const a = after as unknown[];
+  if (tb === 'array') return diffArrays(before as unknown[], after as unknown[], path);
+
+  return Object.is(before, after) ? [] : [{ path, kind: 'changed', before, after }];
+}
+
+/** Larger arrays fall back to comparing by position, to keep the diff fast. */
+const MAX_ALIGNED_CELLS = 4_000_000;
+
+/** Key-order-independent fingerprint, so {a,b} and {b,a} count as equal elements. */
+const canonical = (v: unknown): string => JSON.stringify(sortKeys(v));
+
+/**
+ * Aligns the two arrays on their longest common subsequence of equal elements, so inserting
+ * one item at the top reports one addition instead of a change at every index after it.
+ * Unmatched elements between two aligned ones are compared pairwise (a modified element
+ * shows field-level changes); the rest are additions or removals. Removed elements use
+ * their index in the original, everything else the index in the modified array.
+ */
+function diffArrays(b: unknown[], a: unknown[], path: string): DiffEntry[] {
+  if (b.length * a.length > MAX_ALIGNED_CELLS) {
     const out: DiffEntry[] = [];
     for (let i = 0; i < Math.max(a.length, b.length); i++) {
       const p = `${path}[${i}]`;
@@ -208,7 +324,42 @@ export function diffJson(before: unknown, after: unknown, path = '$'): DiffEntry
     return out;
   }
 
-  return Object.is(before, after) ? [] : [{ path, kind: 'changed', before, after }];
+  const kb = b.map(canonical);
+  const ka = a.map(canonical);
+  // lcs[i][j] = length of the LCS of b[i..] and a[j..].
+  const lcs = Array.from({ length: b.length + 1 }, () => new Uint32Array(a.length + 1));
+  for (let i = b.length - 1; i >= 0; i--) {
+    for (let j = a.length - 1; j >= 0; j--) {
+      lcs[i]![j] = kb[i] === ka[j] ? lcs[i + 1]![j + 1]! + 1 : Math.max(lcs[i + 1]![j]!, lcs[i]![j + 1]!);
+    }
+  }
+
+  const out: DiffEntry[] = [];
+  let removed: number[] = [];
+  let added: number[] = [];
+  const flush = () => {
+    const paired = Math.min(removed.length, added.length);
+    for (let k = 0; k < paired; k++) out.push(...diffJson(b[removed[k]!], a[added[k]!], `${path}[${added[k]}]`));
+    for (const i of removed.slice(paired)) out.push({ path: `${path}[${i}]`, kind: 'removed', before: b[i] });
+    for (const j of added.slice(paired)) out.push({ path: `${path}[${j}]`, kind: 'added', after: a[j] });
+    removed = [];
+    added = [];
+  };
+  let i = 0;
+  let j = 0;
+  while (i < b.length || j < a.length) {
+    if (i < b.length && j < a.length && kb[i] === ka[j]) {
+      flush();
+      i++;
+      j++;
+    } else if (j >= a.length || (i < b.length && lcs[i + 1]![j]! >= lcs[i]![j + 1]!)) {
+      removed.push(i++);
+    } else {
+      added.push(j++);
+    }
+  }
+  flush();
+  return out;
 }
 
 function kindOf(v: unknown): string {

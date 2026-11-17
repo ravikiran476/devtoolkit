@@ -1,15 +1,7 @@
 import { useMemo, useState } from 'react';
 import { Alert, Badge, Button, CopyButton, FieldLabel, KeyValueTable, Panel, Select, TextInput } from '../components/ui';
 import { useNow } from '../hooks/useNow';
-import { pad2, parseTimestamp, relativeTime } from '../lib/time';
-
-const LOCAL_TZ = Intl.DateTimeFormat().resolvedOptions().timeZone;
-
-function allTimeZones(): string[] {
-  const intl = Intl as typeof Intl & { supportedValuesOf?: (key: string) => string[] };
-  const zones = intl.supportedValuesOf?.('timeZone') ?? [];
-  return [...new Set(['UTC', LOCAL_TZ, ...zones])];
-}
+import { LOCAL_TZ, allTimeZones, pad2, parseTimestamp, relativeTime } from '../lib/time';
 
 /** Value for <input type="datetime-local"> in local time. */
 function toDateTimeLocal(ms: number): string {

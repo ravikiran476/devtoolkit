@@ -50,6 +50,15 @@ function isValidMs(ms: number): boolean {
   return Number.isFinite(ms) && !Number.isNaN(new Date(ms).getTime());
 }
 
+export const LOCAL_TZ = Intl.DateTimeFormat().resolvedOptions().timeZone;
+
+/** UTC, the local zone, then every IANA zone the browser knows. */
+export function allTimeZones(): string[] {
+  const intl = Intl as typeof Intl & { supportedValuesOf?: (key: string) => string[] };
+  const zones = intl.supportedValuesOf?.('timeZone') ?? [];
+  return [...new Set(['UTC', LOCAL_TZ, ...zones])];
+}
+
 export function pad2(n: number): string {
   return String(n).padStart(2, '0');
 }
